@@ -26,39 +26,55 @@ LABEL org.opencontainers.image.title="Hermes Agent (Modified)" \
 USER root
 
 # 1. Install additional system packages and CLI utilities
-# Add or remove packages below according to your workload needs
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
-    jq \
+    jq yq \
     ripgrep \
     procps \
     sudo \
+    vim \
+    golang \
+    python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Allow passwordless sudo for the unprivileged hermes user (UID 10000) if required
+# 2. Allow passwordless sudo for the unprivileged hermes user (UID 10000)
 RUN echo 'hermes ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/hermes \
     && chmod 0440 /etc/sudoers.d/hermes
 
-# 3. Copy custom extensions, plugins, skills, and configuration
+# 3. Install uv globally to /usr/local/bin
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    cp /root/.local/bin/uv* /usr/local/bin/ && \
+    chmod 755 /usr/local/bin/uv*
+
+# 4. Copy custom extensions, plugins, skills, and configuration
 COPY custom/ /opt/hermes/custom/
 RUN chmod -R +rX /opt/hermes/custom && \
     if [ -d /opt/hermes/custom/scripts ]; then \
         chmod +x /opt/hermes/custom/scripts/*.sh 2>/dev/null || true; \
     fi
 
-# 4. Optional: Install additional Python dependencies into Hermes's venv
-# If requirements.txt has entries, install them using the container's python/uv
+# 5. Install additional Python dependencies into Hermes's virtual environment
 RUN if [ -f /opt/hermes/custom/requirements.txt ] && grep -vqE '^(#|$)' /opt/hermes/custom/requirements.txt; then \
-        if [ -x /opt/hermes/.venv/bin/pip ]; then \
-            /opt/hermes/.venv/bin/pip install --no-cache-dir -r /opt/hermes/custom/requirements.txt; \
-        elif command -v uv >/dev/null 2>&1; then \
-            uv pip install --python /opt/hermes/.venv -r /opt/hermes/custom/requirements.txt; \
-        fi; \
+        uv pip install --python /opt/hermes/.venv -r /opt/hermes/custom/requirements.txt && \
+        chmod -R a+rX /opt/hermes/.venv; \
     fi
 
 # Environment configuration
 ENV HERMES_CUSTOM_DIR=/opt/hermes/custom
 
+# 6. Install Go CLI utilities (blogwatcher-cli) into /usr/local/bin
+RUN GOBIN=/usr/local/bin go install github.com/JulienTant/blogwatcher-cli/cmd/blogwatcher-cli@latest
+
+# 7. Install Antigravity CLI and expose globally
+USER hermes
+RUN curl -fsSL https://antigravity.google/cli/install.sh | bash
+USER root
+RUN if [ -f /opt/data/.local/bin/agy ]; then \
+        cp /opt/data/.local/bin/agy /usr/local/bin/agy && \
+        chmod 755 /usr/local/bin/agy; \
+    fi
+
+USER root
 # Upstream entrypoint & volume contracts are preserved:
 # ENTRYPOINT [ "/opt/hermes/docker/entrypoint-dispatch.sh" ]
 # VOLUME [ "/opt/data" ]
