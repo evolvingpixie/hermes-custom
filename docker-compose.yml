@@ -1,0 +1,23 @@
+services:
+  hermes:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        HERMES_VERSION: latest
+    image: hermes-agent:custom
+    container_name: hermes-agent-custom
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    environment:
+      - HERMES_UID=1000
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # Persistent agent skills, profiles, and state
+      - ./data:/opt/data
+      # Mount custom plugins/skills directly for fast local iterative development
+      - ./custom/plugins:/opt/data/plugins:ro
+      - ./custom/skills:/opt/data/skills:ro
+    ports:
+      - "8080:8080"

@@ -1,0 +1,12 @@
+.git
+.github
+.gitignore
+.dockerignore
+*.md
+!README.md
+data/
+.hermes/
+.env*
+__pycache__/
+*.pyc
+node_modules/

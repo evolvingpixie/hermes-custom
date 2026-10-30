@@ -1,0 +1,116 @@
+name: Track Upstream Releases
+
+on:
+  schedule:
+    # Check for upstream releases every 6 hours (at 00:00, 06:00, 12:00, 18:00 UTC)
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force multi-arch build even if no new release is detected'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  check-upstream:
+    name: Check NousResearch/hermes-agent Releases
+    runs-on: ubuntu-latest
+    outputs:
+      has_new_release: ${{ steps.check.outputs.has_new_release }}
+      latest_tag: ${{ steps.check.outputs.latest_tag }}
+      previous_tag: ${{ steps.check.outputs.previous_tag }}
+      release_name: ${{ steps.check.outputs.release_name }}
+      release_url: ${{ steps.check.outputs.release_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check latest upstream release
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          UPSTREAM_REPO="NousResearch/hermes-agent"
+          API_URL="https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest"
+
+          echo "Querying GitHub API: ${API_URL}..."
+          RESPONSE=$(curl -sSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "${API_URL}")
+
+          LATEST_TAG=$(echo "$RESPONSE" | jq -r '.tag_name // empty')
+          RELEASE_NAME=$(echo "$RESPONSE" | jq -r '.name // empty')
+          HTML_URL=$(echo "$RESPONSE" | jq -r '.html_url // empty')
+
+          if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
+            echo "::error::Could not determine latest release tag from ${UPSTREAM_REPO}."
+            echo "API Response: ${RESPONSE}"
+            exit 1
+          fi
+
+          CURRENT_TAG=""
+          if [ -f .upstream-version ]; then
+            CURRENT_TAG=$(tr -d '[:space:]' < .upstream-version)
+          fi
+
+          echo "Current recorded version: '${CURRENT_TAG}'"
+          echo "Latest upstream version:  '${LATEST_TAG}'"
+          echo "Upstream release URL:     '${HTML_URL}'"
+
+          FORCE="${{ inputs.force_build }}"
+          if [ "$LATEST_TAG" != "$CURRENT_TAG" ] || [ "$FORCE" = "true" ]; then
+            echo "New upstream release detected (or build forced)!"
+            echo "has_new_release=true" >> "$GITHUB_OUTPUT"
+            echo "latest_tag=${LATEST_TAG}" >> "$GITHUB_OUTPUT"
+            echo "previous_tag=${CURRENT_TAG}" >> "$GITHUB_OUTPUT"
+            echo "release_name=${RELEASE_NAME}" >> "$GITHUB_OUTPUT"
+            echo "release_url=${HTML_URL}" >> "$GITHUB_OUTPUT"
+
+            # Update .upstream-version file
+            echo "${LATEST_TAG}" > .upstream-version
+
+            # Commit and push update back to repository if version changed
+            if [ "$LATEST_TAG" != "$CURRENT_TAG" ]; then
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              git add .upstream-version
+              git commit -m "chore(upstream): bump hermes-agent to ${LATEST_TAG}" -m "Tracked upstream release: ${HTML_URL}"
+              git pull --rebase origin "${{ github.ref_name || 'main' }}" || true
+              git push origin "${{ github.ref_name || 'main' }}"
+            fi
+          else
+            echo "No new release found. Repository is up-to-date with upstream (${CURRENT_TAG})."
+            echo "has_new_release=false" >> "$GITHUB_OUTPUT"
+            echo "latest_tag=${CURRENT_TAG}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upstream status summary
+        run: |
+          echo "### 🔍 Upstream Release Tracking Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Upstream Repository:** [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tracked Release Tag:** \`${{ steps.check.outputs.latest_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Previous Tag:** \`${{ steps.check.outputs.previous_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Triggering Build:** \`${{ steps.check.outputs.has_new_release }}\`" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ steps.check.outputs.release_url }}" ]; then
+            echo "- **Release Details:** [${{ steps.check.outputs.release_name }}](${{ steps.check.outputs.release_url }})" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  trigger-build:
+    name: Build Multi-Arch Release Image
+    needs: check-upstream
+    if: needs.check-upstream.outputs.has_new_release == 'true'
+    uses: ./.github/workflows/build.yml
+    with:
+      hermes_version: ${{ needs.check-upstream.outputs.latest_tag }}
+      push: true
+      platforms: 'linux/amd64,linux/arm64'
+    secrets: inherit

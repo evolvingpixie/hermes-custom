@@ -1,0 +1,4 @@
+# Add additional Python dependencies here for your custom Hermes build.
+# Uncomment or add packages as needed.
+# httpx>=0.27.0
+# pydantic>=2.7.0
