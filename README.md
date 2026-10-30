@@ -44,7 +44,7 @@ hermes-custom/
 
 ### 1. `track-upstream.yml` (Release Watcher)
 
-- **Schedule**: Runs automatically every 6 hours (`cron: '0 */6 * * *'`).
+- **Schedule**: Runs automatically once a day at 00:00 UTC (`cron: '0 0 * * *'`).
 - **Manual Trigger**: Can be dispatched manually from the GitHub Actions tab (`Actions` -> `Track Upstream Releases` -> `Run workflow`). You can toggle `force_build: true` to trigger a build even if no new release was detected.
 - **Mechanism**:
   1. Queries the GitHub API for `https://api.github.com/repos/NousResearch/hermes-agent/releases/latest`.
