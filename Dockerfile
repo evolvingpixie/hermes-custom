@@ -34,6 +34,7 @@ USER root
 # - bind9-dnsutils / iproute2 / netcat-openbsd: Network diagnostics in cluster environments
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    unzip \
     jq yq \
     ripgrep \
     procps \
@@ -46,6 +47,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libportaudio2 libportaudiocpp0 \
     tesseract-ocr tesseract-ocr-eng \
     bind9-dnsutils iproute2 netcat-openbsd \
+    cargo rustc \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Allow passwordless sudo for the unprivileged hermes user (UID 10000)
@@ -105,6 +107,20 @@ RUN if [ -f /opt/data/.local/bin/agy ]; then \
         cp /opt/data/.local/bin/agy /usr/local/bin/agy && \
         chmod 755 /usr/local/bin/agy; \
     fi
+
+# 10. Install Bitwarden CLI (multi-arch for amd64 / arm64)
+ARG BITWARDEN_CLI_VERSION=2026.10.1
+RUN set -eu; \
+    case "${TARGETARCH:-amd64}" in \
+        amd64) bw_asset="bw-linux-${BITWARDEN_CLI_VERSION}.zip" ;; \
+        arm64) bw_asset="bw-linux-arm64-${BITWARDEN_CLI_VERSION}.zip" ;; \
+        *) bw_asset="bw-linux-${BITWARDEN_CLI_VERSION}.zip" ;; \
+    esac; \
+    curl -fsSL -o /tmp/bw.zip "https://github.com/bitwarden/clients/releases/download/cli-v${BITWARDEN_CLI_VERSION}/${bw_asset}"; \
+    unzip -o -q /tmp/bw.zip -d /usr/local/bin/ && \
+    chmod 755 /usr/local/bin/bw && \
+    rm -f /tmp/bw.zip; \
+    /usr/local/bin/bw --version
 
 USER root
 # Upstream entrypoint & volume contracts are preserved:
