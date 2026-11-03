@@ -25,6 +25,8 @@ hermes-custom/
 │       ├── build.yml           # Multi-arch (amd64 / arm64) build and publish workflow
 │       └── track-upstream.yml  # Automated watcher for upstream NousResearch releases
 ├── custom/                     # Custom extensions baked into the image
+│   ├── bin/                    # Custom CLI utilities symlinked into /usr/local/bin
+│   │   └── gale-news           # Gale Cengage newspaper search/list/download CLI
 │   ├── plugins/                # Custom agent plugins
 │   ├── skills/                 # Custom agent skills
 │   ├── scripts/                # Custom initialization and utility scripts
@@ -93,8 +95,9 @@ If you want to push to Docker Hub in addition to GHCR, add the following secrets
 
 1. **System Packages**: Add or modify packages in `Dockerfile` under the `apt-get install` section.
 2. **Python Libraries**: Add library names to `custom/requirements.txt`.
-3. **Plugins & Skills**: Place plugins in `custom/plugins/` and skills in `custom/skills/`.
-4. **Initialization Hooks**: Modify `custom/scripts/custom-init.sh` to execute custom logic on startup.
+3. **CLI Utilities**: Drop executables into `custom/bin/`; they are symlinked into `/usr/local/bin` at build time.
+4. **Plugins & Skills**: Place plugins in `custom/plugins/` and skills in `custom/skills/`.
+5. **Initialization Hooks**: Modify `custom/scripts/custom-init.sh` to execute custom logic on startup.
 
 ---
 

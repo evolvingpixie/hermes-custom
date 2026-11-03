@@ -1,0 +1,667 @@
+#!/usr/bin/env python3
+"""
+Gale News CLI
+Search, list, and download newspaper articles via Gale Cengage using public library credentials.
+Credentials are read from ~/.config/gale-news/config.json, environment variables, or CLI arguments.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import sys
+import urllib.parse
+from pathlib import Path
+import requests
+from bs4 import BeautifulSoup
+
+CONFIG_DIR = Path.home() / ".config" / "gale-news"
+CONFIG_FILE = Path(os.environ.get("GALE_CONFIG", CONFIG_DIR / "config.json"))
+CACHE_DIR = Path.home() / ".cache" / "gale-news"
+CACHE_FILE = CACHE_DIR / "session.json"
+
+PUBLICATIONS = {
+    "nyt": {"name": "The New York Times (Digital Edition)", "code": "54SB"},
+    "nyt-digital": {"name": "The New York Times (Digital Edition)", "code": "54SB"},
+    "nyt-print": {"name": "The New York Times", "code": "2NYT"},
+    "wapo": {"name": "Washingtonpost.com", "code": "0NTQ"},
+}
+
+
+def load_config():
+    """Load configuration from config file, environment variables, with defaults."""
+    cfg = {
+        "card": None,
+        "user_group": None,
+        "prod": "STND",
+    }
+
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    if data.get("card"):
+                        cfg["card"] = str(data["card"]).strip()
+                    if data.get("user_group"):
+                        cfg["user_group"] = str(data["user_group"]).strip()
+                    if data.get("prod"):
+                        cfg["prod"] = str(data["prod"]).strip()
+        except Exception as e:
+            sys.stderr.write(f"Warning: Failed to parse config file {CONFIG_FILE}: {e}\n")
+
+    if os.environ.get("GALE_CARD"):
+        cfg["card"] = os.environ["GALE_CARD"].strip()
+    if os.environ.get("GALE_USER_GROUP"):
+        cfg["user_group"] = os.environ["GALE_USER_GROUP"].strip()
+    if os.environ.get("GALE_PROD"):
+        cfg["prod"] = os.environ["GALE_PROD"].strip()
+
+    return cfg
+
+
+def save_config(cfg):
+    """Save configuration to config.json with restricted permissions."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+    os.chmod(CONFIG_FILE, 0o600)
+
+
+def get_session():
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+    })
+    if CACHE_FILE.exists():
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                cookies = json.load(f)
+                session.cookies.update(cookies)
+        except Exception:
+            pass
+    return session
+
+
+def save_session(session):
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(session.cookies.get_dict(), f)
+    except Exception as e:
+        sys.stderr.write(f"Warning: could not save session cache: {e}\n")
+
+
+def login(session, card, ug, prod):
+    init_url = f"https://go.gale.com/ps/start.do?p={prod}&u={ug}"
+    resp = session.get(init_url)
+    soup = BeautifulSoup(resp.text, "html.parser")
+    form = soup.find("form", id="auth")
+    if not form:
+        if "start.do" in resp.url and "aty=rpas" in resp.url:
+            save_session(session)
+            return True
+        for f in soup.find_all("form"):
+            if "auth" in (f.get("action") or ""):
+                form = f
+                break
+
+    if not form:
+        return False
+
+    action = form.get("action")
+    if not action.startswith("http"):
+        action = "https://galeapps.gale.com" + action
+
+    data = {
+        inp.get("name"): inp.get("value", "")
+        for inp in form.find_all("input")
+        if inp.get("name")
+    }
+    data["password"] = card
+    auth_resp = session.post(action, data=data, allow_redirects=True)
+    if auth_resp.status_code == 200:
+        save_session(session)
+        return True
+    return False
+
+
+def ensure_authenticated(session, card, ug, prod):
+    probe_url = f"https://go.gale.com/ps/start.do?p={prod}&u={ug}"
+    resp = session.get(probe_url, allow_redirects=True)
+    if "galeapps.gale.com/apps/auth" in resp.url or "Suspicious Activity" in resp.text:
+        ok = login(session, card, ug, prod)
+        if not ok:
+            raise RuntimeError(
+                f"Authentication failed for userGroupName='{ug}'. Verify your card barcode and userGroupName."
+            )
+    else:
+        save_session(session)
+
+
+def parse_date(date_str):
+    if not date_str:
+        return None, None
+    if date_str.lower() in ("today", "now"):
+        d = datetime.date.today()
+    elif date_str.lower() == "yesterday":
+        d = datetime.date.today() - datetime.timedelta(days=1)
+    else:
+        clean = re.sub(r"[^\d]", "", date_str)
+        if len(clean) == 8:
+            d = datetime.datetime.strptime(clean, "%Y%m%d").date()
+        else:
+            raise ValueError(f"Cannot parse date '{date_str}'. Expected YYYY-MM-DD or YYYYMMDD.")
+    return f"1{d.strftime('%Y%m%d')}", d.strftime("%Y-%m-%d")
+
+
+def resolve_publication(pub_arg):
+    if not pub_arg or pub_arg.strip().lower() in ("all", "any", "*", "none"):
+        return None, None
+    pub_key = pub_arg.strip().lower()
+    if pub_key in PUBLICATIONS:
+        return PUBLICATIONS[pub_key]["name"], PUBLICATIONS[pub_key]["code"]
+    if ":" in pub_arg:
+        parts = pub_arg.split(":", 1)
+        return parts[0].strip(), parts[1].strip()
+    return pub_arg, ""
+
+
+def build_query(headline=None, pub_name=None, pub_code=None, gale_date=None):
+    parts = []
+    if headline:
+        clean_headline = headline.strip().strip('"')
+        parts.append(f'TI~"{clean_headline}"')
+    if pub_name and pub_code:
+        parts.append(f'PU~"{pub_name}"~~MC~{pub_code}')
+    elif pub_name:
+        parts.append(f'PU~"{pub_name}"')
+    if gale_date:
+        parts.append(f'DA~{gale_date}')
+    return "~~".join(parts)
+
+
+def execute_search(session, qt, ug, prod, limit=30, all_pages=False, card=None):
+    articles = []
+    current_position = 1
+    total_found = None
+
+    while True:
+        if current_position == 1:
+            url = (
+                f"https://go.gale.com/ps/publicationSearch.do?lm=&qt={urllib.parse.quote(qt)}"
+                f"&method=doLinkDirectedSearch&searchType=AdvancedSearchForm"
+                f"&searchMethod=publication+issue+click&userGroupName={ug}&inPS=true&prodId={prod}"
+            )
+        else:
+            url = (
+                f"https://go.gale.com/ps/paginate.do?tabID=T004&searchResultsType=SingleTab"
+                f"&qt={urllib.parse.quote(qt)}&currentPosition={current_position}"
+                f"&userGroupName={ug}&inPS=true&sort=Relevance&prodId={prod}&paginationClicked=true"
+            )
+
+        resp = session.get(url)
+        if "galeapps.gale.com/apps/auth" in resp.url:
+            ensure_authenticated(session, card, ug, prod)
+            resp = session.get(url)
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        if total_found is None:
+            count_el = soup.find(class_="result-count_count")
+            if count_el and count_el.get_text(strip=True).isdigit():
+                total_found = int(count_el.get_text(strip=True))
+
+        items = soup.find_all("li", class_="citation-view")
+        if not items:
+            links = soup.find_all("a", class_="documentLink")
+            if not links:
+                break
+            for a in links:
+                href = a.get("href", "")
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+                raw_id = qs.get("docId", [""])[0]
+                doc_id = raw_id.replace("GALE|", "")
+                title = a.get_text(strip=True)
+                articles.append({
+                    "id": doc_id,
+                    "title": title,
+                    "author": "",
+                    "publication": "",
+                    "doc_type": qs.get("docType", [""])[0],
+                    "words": "",
+                    "date": "",
+                    "snippet": "",
+                })
+        else:
+            for li in items:
+                title_a = li.find("a", class_="documentLink")
+                title = title_a.get_text(strip=True) if title_a else ""
+                href = title_a.get("href", "") if title_a else ""
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+                raw_id = qs.get("docId", [""])[0]
+                doc_id = raw_id.replace("GALE|", "")
+
+                author_el = li.find("span", class_="definition")
+                author = author_el.get_text(strip=True) if author_el else ""
+
+                pub_el = li.find("span", class_="citation-publication")
+                pub_item = pub_el.get_text(strip=True) if pub_el else ""
+
+                doc_type_el = li.find("span", class_="citation-docInfoType")
+                doc_type = doc_type_el.get_text(strip=True) if doc_type_el else qs.get("docType", [""])[0]
+
+                words_el = li.find("span", class_="citation-wordcount")
+                words = words_el.get_text(strip=True) if words_el else ""
+
+                date_el = li.find("span", class_="citation-pubDate")
+                date_str = date_el.get_text(strip=True) if date_el else ""
+
+                snippet_el = li.find("p", class_="citation-snippet") or li.find("div", class_="citation-snippet")
+                snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+
+                articles.append({
+                    "id": doc_id,
+                    "title": title,
+                    "author": author,
+                    "publication": pub_item,
+                    "doc_type": doc_type,
+                    "words": words,
+                    "date": date_str,
+                    "snippet": snippet,
+                })
+
+        if not all_pages and len(articles) >= limit:
+            articles = articles[:limit]
+            break
+
+        pag_next = soup.find("a", class_="pagination-next")
+        if not pag_next or len(items) == 0:
+            break
+
+        current_position += len(items)
+        if total_found and current_position > total_found:
+            break
+
+    return articles, total_found
+
+
+def fetch_article(session, doc_id, ug, prod, card=None):
+    if doc_id.startswith("http"):
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(doc_id).query)
+        doc_id = qs.get("docId", [doc_id])[0]
+
+    clean_id = doc_id.replace("GALE|", "")
+    full_id = f"GALE|{clean_id}"
+
+    url = f"https://go.gale.com/ps/retrieve.do?tabID=T004&docId={full_id}&u={ug}&p={prod}"
+    resp = session.get(url)
+    if "galeapps.gale.com/apps/auth" in resp.url:
+        ensure_authenticated(session, card, ug, prod)
+        resp = session.get(url)
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"Gale returned status {resp.status_code} for document {doc_id}")
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    title_el = soup.find("h1")
+    title = title_el.get_text(strip=True) if title_el else "Untitled"
+
+    # Metadata
+    author_el = soup.find("div", class_="doc-authors") or soup.find("div", class_="author")
+    if author_el:
+        raw_author = author_el.get_text(separator=" ", strip=True)
+        author = re.sub(r"(?i)^authors?:\s*", "", raw_author).strip()
+    else:
+        author = ""
+
+    pub_date_el = soup.find("div", class_="doc-pub-date") or soup.find("span", class_="citation-pubDate")
+    pub_date = pub_date_el.get_text(strip=True).replace("Date:", "").strip() if pub_date_el else ""
+
+    pub_name_el = soup.find("div", class_="publication") or soup.find("span", class_="citation-publication")
+    pub_name = pub_name_el.get_text(strip=True).replace("From:", "").strip() if pub_name_el else ""
+
+    publisher_el = soup.find("div", class_="publisher")
+    publisher = publisher_el.get_text(strip=True).replace("Publisher:", "").strip() if publisher_el else ""
+
+    # Document body
+    doc_text = soup.find("div", class_="document-text")
+    paragraphs = []
+    if doc_text:
+        for div in doc_text.find_all("div", class_="SideNotePara"):
+            p = div.find("p")
+            raw_text = p.get_text(strip=True) if p else div.get_text(strip=True)
+            if not raw_text:
+                continue
+            clean = raw_text.replace("''", '"').replace("``", '"')
+            paragraphs.append(clean)
+
+    # Detect byline in first paragraph if author missing
+    if not author and paragraphs and paragraphs[0].lower().startswith("byline:"):
+        author = re.sub(r"(?i)^byline:\s*", "", paragraphs.pop(0)).strip()
+
+    return {
+        "id": full_id,
+        "clean_id": clean_id,
+        "title": title,
+        "author": author,
+        "pub_date": pub_date,
+        "publication": pub_name,
+        "publisher": publisher,
+        "paragraphs": paragraphs,
+        "raw_soup": soup,
+    }
+
+
+def article_to_markdown(art):
+    lines = []
+    lines.append(f"# {art['title']}\n")
+    if art["publication"]:
+        lines.append(f"**Publication:** {art['publication']}  ")
+    if art["pub_date"]:
+        lines.append(f"**Date:** {art['pub_date']}  ")
+    if art["author"]:
+        lines.append(f"**Author:** {art['author']}  ")
+    if art["id"]:
+        lines.append(f"**Gale ID:** `{art['id']}`  ")
+    lines.append("\n---\n")
+
+    for p in art["paragraphs"]:
+        if p.startswith("PHOTO") or p.startswith("CAPTION"):
+            lines.append(f"> *{p}*\n")
+        else:
+            lines.append(f"{p}\n")
+
+    return "\n".join(lines)
+
+
+def download_pdf(session, doc_id, outpath, ug, prod, card=None):
+    art_data = fetch_article(session, doc_id, ug, prod, card=card)
+    soup = art_data["raw_soup"]
+    pdf_form = soup.find("form", action=lambda a: a and "pdfGenerator" in a)
+    if not pdf_form:
+        raise RuntimeError("No PDF generator endpoint found on article page.")
+
+    action = "https://go.gale.com" + pdf_form.get("action")
+    post_data = {
+        inp.get("name"): inp.get("value", "")
+        for inp in pdf_form.find_all("input")
+        if inp.get("name")
+    }
+    pdf_resp = session.post(action, data=post_data)
+    if pdf_resp.status_code == 200 and pdf_resp.content.startswith(b"%PDF"):
+        with open(outpath, "wb") as f:
+            f.write(pdf_resp.content)
+        return True
+    else:
+        raise RuntimeError(f"PDF download failed: status {pdf_resp.status_code}")
+
+
+def slugify(text):
+    text = re.sub(r"[^\w\s-]", "", text).strip().lower()
+    return re.sub(r"[-\s]+", "-", text)[:60]
+
+
+def print_article_list(articles, total, header_title, show_pub=False):
+    print(f"=== {header_title} ===")
+    total_str = f" of {total}" if total is not None else ""
+    print(f"Showing {len(articles)}{total_str} articles:\n")
+
+    for idx, art in enumerate(articles, 1):
+        meta_parts = []
+        if art.get("date"):
+            meta_parts.append(art["date"])
+        if show_pub and art.get("publication"):
+            meta_parts.append(art["publication"])
+        if art.get("author"):
+            meta_parts.append(art["author"])
+        if art.get("words"):
+            meta_parts.append(art["words"])
+        type_str = f" [{art['doc_type']}]" if art.get("doc_type") else ""
+        meta_str = " | ".join(meta_parts) + type_str
+
+        print(f"{idx:2d}. [{art['id']}] {art['title']}")
+        if meta_str:
+            print(f"    {meta_str}")
+        if art.get("snippet"):
+            print(f"    \"{art['snippet'][:110]}...\"")
+        print()
+
+
+def main():
+    cfg = load_config()
+
+    parser = argparse.ArgumentParser(
+        description="Search and download news articles via Gale Cengage.",
+        epilog="Credentials are read from ~/.config/gale-news/config.json, env vars (GALE_CARD, GALE_USER_GROUP, GALE_PROD), or CLI flags.",
+    )
+    parser.add_argument("--card", default=None, help="Library card barcode (overrides env / config)")
+    parser.add_argument("--user-group", default=None, help="Gale userGroupName (overrides env / config)")
+    parser.add_argument("--prod", default=None, help="Gale prodId (default: STND)")
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # list command
+    list_p = subparsers.add_parser("list", aliases=["ls"], help="List issue articles by date")
+    list_p.add_argument("-p", "--pub", default="nyt", help="Publication: 'nyt' (Digital), 'nyt-print', 'wapo', 'all', or 'Name:Code'")
+    list_p.add_argument("-d", "--date", default="today", help="Date: YYYY-MM-DD, YYYYMMDD, today, yesterday (default: today)")
+    list_p.add_argument("-n", "--limit", type=int, default=30, help="Max items to list (default: 30)")
+    list_p.add_argument("--all", action="store_true", help="Fetch all pages for the issue")
+    list_p.add_argument("--json", action="store_true", help="Output JSON instead of table")
+
+    # search command (headline search + optional date)
+    search_p = subparsers.add_parser("search", aliases=["find"], help="Search articles by headline with optional date filter")
+    search_p.add_argument("query", help="Headline keywords or phrase to search (e.g. 'climate change', 'Musk')")
+    search_p.add_argument("-p", "--pub", default="nyt", help="Publication: 'nyt', 'nyt-print', 'wapo', 'all' (default: nyt)")
+    search_p.add_argument("-d", "--date", default=None, help="Optional date: YYYY-MM-DD, today, yesterday")
+    search_p.add_argument("-n", "--limit", type=int, default=30, help="Max items to list (default: 30)")
+    search_p.add_argument("--all", action="store_true", help="Fetch all matching pages")
+    search_p.add_argument("--json", action="store_true", help="Output JSON instead of table")
+
+    # get command
+    get_p = subparsers.add_parser("get", aliases=["download", "cat"], help="Download article by ID as Markdown")
+    get_p.add_argument("doc_id", help="Gale Document ID (e.g. A903353558 or GALE|A903353558) or URL")
+    get_p.add_argument("-o", "--output", help="Output file path (default stdout, or directory)")
+    get_p.add_argument("--pdf", action="store_true", help="Download as native PDF instead of Markdown")
+
+    # download-issue command
+    issue_p = subparsers.add_parser("download-issue", help="Download all articles for an entire issue into a directory")
+    issue_p.add_argument("-p", "--pub", default="nyt", help="Publication: 'nyt', 'nyt-print', 'wapo'")
+    issue_p.add_argument("-d", "--date", default="today", help="Date: YYYY-MM-DD, today, yesterday")
+    issue_p.add_argument("-o", "--outdir", help="Output directory")
+
+    # login command
+    subparsers.add_parser("login", help="Re-authenticate and refresh session cookies")
+
+    # config command
+    cfg_p = subparsers.add_parser("config", help="View or update credentials in config file")
+    cfg_p.add_argument("--set-card", help="Save library card barcode to config file")
+    cfg_p.add_argument("--set-user-group", help="Save userGroupName to config file")
+    cfg_p.add_argument("--set-prod", help="Save prodId to config file")
+
+    args = parser.parse_args()
+
+    # Handle config management command
+    if args.command == "config":
+        modified = False
+        if args.set_card:
+            cfg["card"] = args.set_card.strip()
+            modified = True
+        if args.set_user_group:
+            cfg["user_group"] = args.set_user_group.strip()
+            modified = True
+        if args.set_prod:
+            cfg["prod"] = args.set_prod.strip()
+            modified = True
+
+        if modified:
+            save_config(cfg)
+            print(f"Updated configuration saved to {CONFIG_FILE}")
+
+        card_display = f"****{cfg['card'][-4:]}" if cfg["card"] and len(cfg["card"]) >= 4 else (cfg["card"] or "<not set>")
+        print(f"Config file: {CONFIG_FILE}")
+        print(f"  card:       {card_display}")
+        print(f"  user_group: {cfg['user_group'] or '<not set>'}")
+        print(f"  prod:       {cfg['prod']}")
+        return
+
+    # Resolve active credentials
+    card = args.card or cfg["card"]
+    ug = args.user_group or cfg["user_group"]
+    prod = args.prod or cfg["prod"]
+
+    if not card or not ug:
+        print(
+            "Error: Missing library credentials (card barcode or userGroupName).\n"
+            "Please configure using one of the following methods:\n\n"
+            f"1. Config file ({CONFIG_FILE}):\n"
+            '   gale-news config --set-card "YOUR_BARCODE" --set-user-group "YOUR_USERGROUP"\n\n'
+            "2. Environment variables:\n"
+            '   export GALE_CARD="YOUR_BARCODE"\n'
+            '   export GALE_USER_GROUP="YOUR_USERGROUP"\n\n'
+            "3. CLI arguments:\n"
+            '   gale-news --card "YOUR_BARCODE" --user-group "YOUR_USERGROUP" <command> ...\n',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    session = get_session()
+
+    if args.command == "login":
+        card_display = f"****{card[-4:]}" if len(card) >= 4 else card
+        print(f"Logging in to Gale with card {card_display} (ug={ug}, prod={prod})...")
+        ok = login(session, card=card, ug=ug, prod=prod)
+        if ok:
+            print("Login successful! Session cached.")
+        else:
+            print("Login failed.", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    ensure_authenticated(session, card=card, ug=ug, prod=prod)
+
+    if args.command in ("list", "ls"):
+        pub_name, pub_code = resolve_publication(args.pub)
+        gale_date, clean_date = parse_date(args.date)
+        qt = build_query(pub_name=pub_name, pub_code=pub_code, gale_date=gale_date)
+
+        articles, total = execute_search(
+            session,
+            qt,
+            ug=ug,
+            prod=prod,
+            limit=args.limit,
+            all_pages=args.all,
+            card=card,
+        )
+
+        if args.json:
+            print(json.dumps({
+                "total": total,
+                "date": clean_date,
+                "publication": pub_name or "All",
+                "articles": articles
+            }, indent=2))
+            return
+
+        header = f"{pub_name or 'All Publications'} ({clean_date})"
+        print_article_list(articles, total, header, show_pub=(pub_name is None))
+        if total == 0 and args.date == "today":
+            print("(Note: Today's digital edition issue may not be indexed yet. Try '-d yesterday').")
+
+    elif args.command in ("search", "find"):
+        pub_name, pub_code = resolve_publication(args.pub)
+        gale_date, clean_date = parse_date(args.date) if args.date else (None, None)
+        qt = build_query(headline=args.query, pub_name=pub_name, pub_code=pub_code, gale_date=gale_date)
+
+        articles, total = execute_search(
+            session,
+            qt,
+            ug=ug,
+            prod=prod,
+            limit=args.limit,
+            all_pages=args.all,
+            card=card,
+        )
+
+        if args.json:
+            print(json.dumps({
+                "query": args.query,
+                "total": total,
+                "date": clean_date,
+                "publication": pub_name or "All",
+                "articles": articles
+            }, indent=2))
+            return
+
+        scope = pub_name or "All Publications"
+        date_scope = f" on {clean_date}" if clean_date else " (All Dates)"
+        header = f"Headline: \"{args.query}\" in {scope}{date_scope}"
+        print_article_list(articles, total, header, show_pub=(pub_name is None))
+
+    elif args.command in ("get", "download", "cat"):
+        if args.pdf:
+            outpath = args.output
+            if not outpath or outpath == "-":
+                outpath = f"{args.doc_id.replace('GALE|', '')}.pdf"
+            print(f"Downloading PDF for {args.doc_id} to {outpath}...", file=sys.stderr)
+            download_pdf(session, args.doc_id, outpath, ug=ug, prod=prod, card=card)
+            print(f"Saved PDF to {outpath}", file=sys.stderr)
+            return
+
+        art = fetch_article(session, args.doc_id, ug=ug, prod=prod, card=card)
+        md = article_to_markdown(art)
+
+        if not args.output or args.output == "-":
+            sys.stdout.write(md)
+        else:
+            out_p = Path(args.output)
+            if out_p.is_dir():
+                slug = slugify(art["title"])
+                date_slug = re.sub(r"[^\d]", "", art.get("pub_date", "")) or "article"
+                out_p = out_p / f"{date_slug}_{art['clean_id']}_{slug}.md"
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_p, "w", encoding="utf-8") as f:
+                f.write(md)
+            print(f"Saved Markdown to {out_p}", file=sys.stderr)
+
+    elif args.command == "download-issue":
+        pub_name, pub_code = resolve_publication(args.pub)
+        gale_date, clean_date = parse_date(args.date)
+        qt = build_query(pub_name=pub_name, pub_code=pub_code, gale_date=gale_date)
+        articles, total = execute_search(
+            session,
+            qt,
+            ug=ug,
+            prod=prod,
+            all_pages=True,
+            card=card,
+        )
+        print(f"Found {len(articles)} articles for {pub_name} on {clean_date}.")
+        out_dir = Path(args.outdir) if args.outdir else Path(f"./{args.pub}_{clean_date}")
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        for i, art_info in enumerate(articles, 1):
+            doc_id = art_info["id"]
+            title = art_info["title"]
+            slug = slugify(title)
+            file_name = out_dir / f"{i:02d}_{doc_id}_{slug}.md"
+            try:
+                art = fetch_article(session, doc_id, ug=ug, prod=prod, card=card)
+                md = article_to_markdown(art)
+                with open(file_name, "w", encoding="utf-8") as f:
+                    f.write(md)
+                print(f"[{i}/{len(articles)}] Saved: {file_name.name}")
+            except Exception as e:
+                print(f"[{i}/{len(articles)}] Error fetching {doc_id}: {e}", file=sys.stderr)
+
+        print(f"\nAll articles saved to {out_dir}")
+
+
+if __name__ == "__main__":
+    main()

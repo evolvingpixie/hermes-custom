@@ -64,6 +64,9 @@ COPY custom/ /opt/hermes/custom/
 RUN chmod -R +rX /opt/hermes/custom && \
     if [ -d /opt/hermes/custom/scripts ]; then \
         chmod +x /opt/hermes/custom/scripts/*.sh 2>/dev/null || true; \
+    fi && \
+    if [ -d /opt/hermes/custom/bin ]; then \
+        chmod +x /opt/hermes/custom/bin/* 2>/dev/null || true; \
     fi
 
 # 5. Wire custom initialization hook into s6-overlay cont-init.d (runs after 01-hermes-setup)
@@ -78,6 +81,17 @@ RUN if [ -f /opt/hermes/custom/requirements.txt ] && grep -vqE '^(#|$)' /opt/her
         uv pip install --python /opt/hermes/.venv -r /opt/hermes/custom/requirements.txt && \
         chmod -R a+rX /opt/hermes/.venv; \
     fi
+
+# 6b. Install custom CLI utilities from custom/bin onto the global PATH
+# - gale-news: Gale Cengage newspaper search/list/download CLI (Python 3, requests + bs4)
+RUN if [ -d /opt/hermes/custom/bin ]; then \
+        for f in /opt/hermes/custom/bin/*; do \
+            [ -f "$f" ] || continue; \
+            ln -sf "$f" "/usr/local/bin/$(basename "$f")"; \
+        done; \
+    fi && \
+    command -v gale-news >/dev/null && \
+    gale-news --help >/dev/null
 
 # Environment configuration
 ENV HERMES_CUSTOM_DIR=/opt/hermes/custom
