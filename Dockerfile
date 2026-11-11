@@ -47,8 +47,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libportaudio2 libportaudiocpp0 \
     tesseract-ocr tesseract-ocr-eng \
     bind9-dnsutils iproute2 netcat-openbsd \
-    cargo rustc \
-    && rm -rf /var/lib/apt/lists/*
+    cargo rustc libolm-dev \
+    && rm -rf /var/lib/apt/lists/* && npm install -g pnpm
 
 # 2. Allow passwordless sudo for the unprivileged hermes user (UID 10000)
 RUN echo 'hermes ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/hermes \

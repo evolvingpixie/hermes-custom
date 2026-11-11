@@ -19,7 +19,7 @@ pyyaml>=6.0.1
 ldap3>=2.9.1
 
 # langfuse telemetry plugin
-langfuse>=2.50.0
+langfuse>=4.15.0
 
 # MQTT / Home Assistant platform integration
 paho-mqtt>=2.1.0
